@@ -260,14 +260,26 @@ let aaModelData: AAModelLevels | null = null;
 /** Extract base slug and pi thinking level from an AA entry slug. */
 function parseEntryLevel(slug: string, name: string): { baseSlug: string; level: string } | null {
 	const s = slug.toLowerCase();
+	const n = name.toLowerCase();
+
+	// "-max" is ambiguous: it can be a thinking-effort suffix, but it is
+	// also part of model names such as Qwen3.8 Max. Only treat it as an
+	// effort suffix when the display name explicitly identifies max effort.
+	const maxIsModelName =
+		s.endsWith("-max") &&
+		!/\(\s*max\s*\)/.test(n) &&
+		!/\bmax[- ]effort\b/.test(n);
+
 	for (const { suffix, level } of SUFFIX_TO_LEVEL) {
+		// Do not strip the model-name "-max" suffix (for example,
+		// "qwen3-8-max"). Other effort suffixes remain unaffected.
+		if (maxIsModelName && suffix === "-max") continue;
 		if (s.endsWith(suffix)) {
 			const base = s.slice(0, -suffix.length);
 			if (base.length > 0) return { baseSlug: base, level };
 		}
 	}
 	// No known slug suffix — check name for reasoning-mode hints
-	const n = name.toLowerCase();
 	const nameLevelRe = /\(\s*(minimal|low|medium|high|xhigh|max|non.reasoning|non reasoning|reasoning)\s*\)/;
 	const nameMatch = n.match(nameLevelRe);
 	if (nameMatch) {
@@ -363,13 +375,39 @@ function findLevelMap(
 	};
 
 	/**
-	 * Prefix match is only valid when the pi model name suffix after the AA slug
-	 * is a version/checkpoint suffix (only dashes and digits starting with -N) or
-	 * empty — not a sub-model name like "-7-code". This prevents false matches
-	 * like K2 → K2.7-Code while allowing DeepSeek-V3 → DeepSeek-V3-0324.
+	 * Gateway providers (such as opencode-go) expose canonical model IDs
+	 * without the upstream creator in the provider name. If an exact model
+	 * slug identifies one AA creator unambiguously, use that match as a safe
+	 * provider-agnostic fallback.
 	 */
+	const getUniqueMatch = (matches: Set<Map<string, number>>): Map<string, number> | undefined => {
+		if (matches.size !== 1) return undefined;
+		let onlyMatch: Map<string, number> | undefined;
+		matches.forEach((match) => { onlyMatch = match; });
+		return onlyMatch;
+	};
+
+	const tryLookupAnyCreator = (md: string): Map<string, number> | undefined => {
+		const matches = new Set<Map<string, number>>();
+		for (const c of normalForms(md)) {
+			const suffix = `/${c}`;
+			data.forEach((value, key) => {
+				if (key.endsWith(suffix)) matches.add(value);
+			});
+		}
+		return getUniqueMatch(matches);
+	};
+
+	/**
+	 * Prefix match is only valid when the pi model name suffix after the AA slug
+	 * is a version/checkpoint suffix (only dashes and digits starting with -N),
+	 * a known AA naming variant, or empty — not a sub-model name like
+	 * "-7-code". This prevents false matches like K2 → K2.7-Code while allowing
+	 * DeepSeek-V3 → DeepSeek-V3-0324 and Qwen3.8 Flash → Qwen3.8-Flash-Next.
+	 */
+	const KNOWN_AA_VARIANT_SUFFIXES = new Set(["-next"]);
 	const validPrefixSuffix = (rest: string): boolean =>
-		rest === "" || /^-\d[\d-]*$/.test(rest);
+		rest === "" || /^-\d[\d-]*$/.test(rest) || KNOWN_AA_VARIANT_SUFFIXES.has(rest);
 
 	/** Try prefix matching with a given (provider, model) pair. */
 	const tryPrefix = (pr: string, md: string): Map<string, number> | undefined => {
@@ -399,6 +437,23 @@ function findLevelMap(
 		return findFirst((aaSlug) =>
 			norm.some((c) => aaSlug.startsWith(c) && validPrefixSuffix(aaSlug.slice(c.length))),
 		);
+	};
+
+	/** Prefix fallback for gateway providers without a creator mapping. */
+	const tryPrefixAnyCreator = (md: string): Map<string, number> | undefined => {
+		const norm = normalForms(md);
+		const matches = new Set<Map<string, number>>();
+		data.forEach((value, key) => {
+			const slash = key.indexOf("/");
+			if (slash < 0) return;
+			const aaSlug = key.slice(slash + 1);
+			const piStartsAA = md.startsWith(aaSlug) && validPrefixSuffix(md.slice(aaSlug.length));
+			const aaStartsPi = norm.some((c) =>
+				aaSlug.startsWith(c) && validPrefixSuffix(aaSlug.slice(c.length)),
+			);
+			if (piStartsAA || aaStartsPi) matches.add(value);
+		});
+		return getUniqueMatch(matches);
 	};
 
 	// 1. Try pi's provider directly (e.g. openrouter/deepseek-v4-flash)
@@ -455,6 +510,14 @@ function findLevelMap(
 			if (hit6d) return hit6d;
 		}
 	}
+
+	// Gateway providers may not have a creator alias. An exact, unique
+	// model-slug match is still safe and covers those provider catalogs.
+	const sourceModel = slashIdx >= 0 ? mid.slice(slashIdx + 1) : mid;
+	const hitAnyCreator = tryLookupAnyCreator(sourceModel);
+	if (hitAnyCreator) return hitAnyCreator;
+	const hitAnyCreatorPrefix = tryPrefixAnyCreator(sourceModel);
+	if (hitAnyCreatorPrefix) return hitAnyCreatorPrefix;
 
 	// 5. Clean model name (strip ":free", "-latest" etc.) and retry
 	const cleanMid = mid.replace(/:.*$/, "").replace(/-latest$/, "");
