@@ -41,15 +41,16 @@ const AA_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface ModelRow {
 	slug: string;
-	inputPrice: number;
-	outputPrice: number;
-	contextWindow: number;
+	inputPrice: number | null;
+	outputPrice: number | null;
+	contextWindow: number | null;
 	codingIndex: string;
 	codingSortValue: number;
 	thinkingLevels: string;
 	inputModalities: string;
 	provider: string;
 	modelId: string;
+	isFree: boolean;
 }
 
 function getSlug(model: { provider: string; id: string; name: string }): string {
@@ -148,23 +149,34 @@ function getThinkingLevelsLabel(model: { reasoning: boolean }, levels: string[])
 	return result;
 }
 
-function getInputModalitiesLabel(modalities: string[]): string {
-	if (modalities.includes("image")) return "text+img";
+function getInputModalitiesLabel(modalities: string[] | undefined | null): string {
+	if (Array.isArray(modalities) && modalities.includes("image")) return "text+img";
 	return "text";
 }
 
-function formatPrice(price: number): string {
+function formatPrice(price: number | null | undefined): string {
+	if (price == null || typeof price !== "number" || !Number.isFinite(price)) return "—";
 	if (price >= 10) {
 		return `$${Math.round(price)}`;
 	}
 	return `$${price.toFixed(2)}`;
 }
 
-function formatContextWindow(window: number): string {
+function formatContextWindow(window: number | null | undefined): string {
+	if (window == null || typeof window !== "number" || !Number.isFinite(window) || window <= 0) return "—";
 	if (window >= 1_000_000) {
 		return `${(window / 1_000_000).toFixed(1)}M`;
 	}
 	return `${Math.round(window / 1000)}K`;
+}
+
+function isFreeModelLocal(model: { _freeKnown?: boolean; _isFree?: boolean; _pricingKnown?: boolean; cost?: { input?: number | null; output?: number | null } | null; name?: string; id?: string }): boolean {
+	if ((model as any)._freeKnown === true) return (model as any)._isFree === true;
+	const name = ((model as any).name ?? (model as any).id ?? "").toLowerCase();
+	const hasFreeInName = name.includes("free");
+	if ((model as any)._pricingKnown === false) return hasFreeInName;
+	const isZeroCost = ((model.cost?.input ?? 0) === 0 && (model.cost?.output ?? 0) === 0);
+	return isZeroCost || hasFreeInName;
 }
 
 /** Fit plain text into a fixed-width cell (truncate then pad). */
@@ -693,6 +705,7 @@ function initAAData(): void {
 type SortColumn = "name" | "input" | "output" | "coding";
 
 class ExtraInfoTable {
+	private allRows: ModelRow[];
 	private rows: ModelRow[];
 	private theme: Theme;
 	private done: (value: string | undefined) => void;
@@ -701,15 +714,20 @@ class ExtraInfoTable {
 	private sortColumn: SortColumn = "output";
 	private sortDirection: "asc" | "desc" = "asc";
 	private cachedLines: string[] | undefined;
+	private terminalRows: number;
+	private freeOnly = false;
 
 	constructor(
 		rows: ModelRow[],
 		theme: Theme,
 		done: (value: string | undefined) => void,
+		terminalRows?: number,
 	) {
+		this.allRows = [...rows];
 		this.rows = rows;
 		this.theme = theme;
 		this.done = done;
+		this.terminalRows = terminalRows ?? (typeof process !== "undefined" && (process.stdout as any)?.rows) ?? 30;
 	}
 
 	handleInput(data: string): void {
@@ -733,6 +751,11 @@ class ExtraInfoTable {
 		}
 		if (matchesKey(data, "c")) {
 			this.sortBy("coding");
+			return;
+		}
+
+		if (matchesKey(data, "f")) {
+			this.toggleFreeOnly();
 			return;
 		}
 
@@ -765,6 +788,20 @@ class ExtraInfoTable {
 			return;
 		}
 
+		if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+b")) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisibleRows());
+			this.ensureVisible();
+			this.invalidate();
+			return;
+		}
+
+		if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+f") || matchesKey(data, "ctrl+d")) {
+			this.selectedIndex = Math.min(this.rows.length - 1, this.selectedIndex + this.maxVisibleRows());
+			this.ensureVisible();
+			this.invalidate();
+			return;
+		}
+
 		if (matchesKey(data, "return") || matchesKey(data, "space")) {
 			const row = this.rows[this.selectedIndex];
 			if (!row) return;
@@ -783,32 +820,53 @@ class ExtraInfoTable {
 		}
 
 		const dir = this.sortDirection === "asc" ? 1 : -1;
-		this.rows.sort((a, b) => {
+		const cmpFn = (a: ModelRow, b: ModelRow) => {
 			let cmp: number;
 			switch (column) {
 				case "name":
 					cmp = a.slug.localeCompare(b.slug);
 					break;
 				case "input":
-					cmp = a.inputPrice - b.inputPrice;
+					cmp = (a.inputPrice ?? Number.POSITIVE_INFINITY) - (b.inputPrice ?? Number.POSITIVE_INFINITY);
 					break;
 				case "output":
-					cmp = a.outputPrice - b.outputPrice;
+					cmp = (a.outputPrice ?? Number.POSITIVE_INFINITY) - (b.outputPrice ?? Number.POSITIVE_INFINITY);
 					break;
 				case "coding":
 					cmp = a.codingSortValue - b.codingSortValue;
 					break;
 			}
 			return cmp * dir;
-		});
+		};
+		this.allRows.sort(cmpFn);
+		this.rows.sort(cmpFn);
 
 		this.selectedIndex = 0;
 		this.scrollOffset = 0;
 		this.invalidate();
 	}
 
+	private toggleFreeOnly(): void {
+		this.freeOnly = !this.freeOnly;
+		if (this.freeOnly) {
+			const freeRows = this.allRows.filter((r) => r.isFree);
+			// Keep current sort order; if no free models, keep empty but allow toggle back
+			this.rows = freeRows;
+		} else {
+			this.rows = [...this.allRows];
+		}
+		this.selectedIndex = 0;
+		this.scrollOffset = 0;
+		this.invalidate();
+	}
+
 	private maxVisibleRows(): number {
-		return this.rows.length;
+		// Reserve lines for header (blank+header+separator+filter) + footer (blank+hint+separator)
+		const overhead = 9;
+		const available = this.terminalRows - overhead;
+		// Clamp to sensible range: at least 5 rows, at most 30 so table stays readable on tall terminals
+		const capped = Math.max(5, Math.min(30, available));
+		return Math.min(this.rows.length, capped);
 	}
 
 	ensureVisible(): void {
@@ -875,36 +933,65 @@ class ExtraInfoTable {
 		// Separator line
 		add(dim("  " + "-".repeat(Math.min(width, rowWidth))));
 
-		// ── Data rows ──
-		for (let i = this.scrollOffset; i < this.rows.length; i++) {
-			const row = this.rows[i];
-			const isSelected = i === this.selectedIndex;
+		// ── Free filter status ──
+		if (this.freeOnly) {
+			add(accent(`  ◆ FREE only ${this.rows.length}/${this.allRows.length} — press f to show all`));
+		} else {
+			const freeCount = this.allRows.filter((r) => r.isFree).length;
+			if (freeCount > 0 && freeCount < this.allRows.length) {
+				add(dim(`  f: filter free (${freeCount}/${this.allRows.length})`));
+			}
+		}
 
-			const slugCell = fitCell(row.slug, colSlug, "left");
-			const inCell = fitCell(formatPrice(row.inputPrice), colIn, "right");
-			const outCell = fitCell(formatPrice(row.outputPrice), colOut, "right");
-			const ctxCell = fitCell(formatContextWindow(row.contextWindow), colCtx, "right");
-			const modCell = fitCell(row.inputModalities, colMod, "left");
-			const thinkCell = fitCell(row.thinkingLevels, colThink, "left");
-			const codeCell = fitCell(row.codingIndex, colCode, "left");
+		// ── Data rows (viewport with paging) ──
+		const maxVisible = this.maxVisibleRows();
+		const endIndex = Math.min(this.scrollOffset + maxVisible, this.rows.length);
+		if (this.rows.length === 0) {
+			add(dim("  (no models match filter — press f to toggle)"));
+		} else {
+			if (this.scrollOffset > 0) {
+				add(dim(`  ↑ ${this.scrollOffset} more above`));
+			}
+			for (let i = this.scrollOffset; i < endIndex; i++) {
+				const row = this.rows[i];
+				const isSelected = i === this.selectedIndex;
 
-			let plainRow = [slugCell, inCell, outCell, ctxCell, modCell, thinkCell, codeCell].join(sep);
-			plainRow = truncateToWidth(plainRow, rowWidth);
+				const slugCell = fitCell(row.slug, colSlug, "left");
+				const inCell = fitCell(formatPrice(row.inputPrice), colIn, "right");
+				const outCell = fitCell(formatPrice(row.outputPrice), colOut, "right");
+				const ctxCell = fitCell(formatContextWindow(row.contextWindow), colCtx, "right");
+				const modCell = fitCell(row.inputModalities, colMod, "left");
+				const thinkCell = fitCell(row.thinkingLevels, colThink, "left");
+				const codeCell = fitCell(row.codingIndex, colCode, "left");
 
-			if (isSelected) {
-				add(accent("> " + plainRow));
-			} else {
-				add("  " + text(plainRow));
+				let plainRow = [slugCell, inCell, outCell, ctxCell, modCell, thinkCell, codeCell].join(sep);
+				plainRow = truncateToWidth(plainRow, rowWidth);
+
+				if (isSelected) {
+					add(accent("> " + plainRow));
+				} else {
+					add("  " + text(plainRow));
+				}
+			}
+			if (endIndex < this.rows.length) {
+				add(dim(`  ↓ ${this.rows.length - endIndex} more below`));
 			}
 		}
 
 		// ── Footer ──
 		add("");
-		const scrollInfo =
-			this.rows.length > this.maxVisibleRows()
-				? `${this.selectedIndex + 1}/${this.rows.length}`
-				: `${this.rows.length} models`;
-		const footerText = `  ↑↓/jk navigate  •  n/i/o/c sort  •  Enter select  •  q/Esc  •  ${scrollInfo}`;
+		let scrollInfo: string;
+		if (this.rows.length === 0) {
+			scrollInfo = this.freeOnly ? `0 free / ${this.allRows.length} total` : "0 models";
+		} else if (this.rows.length > this.maxVisibleRows()) {
+			scrollInfo = `${this.selectedIndex + 1}/${this.rows.length}`;
+			if (this.freeOnly) scrollInfo += ` (FREE ${this.rows.length}/${this.allRows.length})`;
+		} else {
+			scrollInfo = `${this.rows.length} models`;
+			if (this.freeOnly) scrollInfo = `FREE ${this.rows.length}/${this.allRows.length}`;
+		}
+		const filterHint = this.freeOnly ? "f free:ON" : "f free";
+		const footerText = `  ↑↓/jk PgUp/Dn navigate  •  n/i/o/c sort  •  ${filterHint}  •  Enter select  •  q/Esc  •  ${scrollInfo}`;
 		add(dim(footerText));
 		add(dim("  " + "-".repeat(Math.min(width, rowWidth))));
 
@@ -1012,10 +1099,14 @@ async function showScopedModelsTable(
 		if (found >= 0) initialIndex = found;
 	}
 
-	// Show interactive table
+	// Show interactive table — pass terminal height so table can page and fit on screen
 	const selectedPath = await ctx.ui.custom<string | undefined>(
-		(_tui, theme, _kb, done) => {
-			const table = new ExtraInfoTable(rows, theme, done);
+		(tui, theme, _kb, done) => {
+			const termRows =
+				(tui as unknown as { terminal?: { rows?: number } })?.terminal?.rows ??
+				(typeof process !== "undefined" ? (process.stdout as unknown as { rows?: number })?.rows : undefined) ??
+				30;
+			const table = new ExtraInfoTable(rows, theme, done, termRows);
 			table.selectedIndex = initialIndex;
 			table.ensureVisible();
 			return table;
@@ -1055,9 +1146,9 @@ function buildRows(
 		provider: string;
 		id: string;
 		name: string;
-		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
-		contextWindow: number;
-		input: string[];
+		cost: { input: number | null; output: number | null; cacheRead: number; cacheWrite: number } | null | undefined;
+		contextWindow: number | null | undefined;
+		input: string[] | null | undefined;
 		reasoning: boolean;
 	}[],
 	aaModelData: AAModelLevels | null,
@@ -1081,19 +1172,24 @@ function buildRows(
 
 		rows.push({
 			slug: getSlug(model),
-			inputPrice: model.cost.input,
-			outputPrice: model.cost.output,
-			contextWindow: model.contextWindow,
+			inputPrice: model.cost?.input ?? null,
+			outputPrice: model.cost?.output ?? null,
+			contextWindow: model.contextWindow ?? null,
 			codingIndex,
 			codingSortValue,
 			thinkingLevels: getThinkingLevelsLabel(model, levels),
-			inputModalities: getInputModalitiesLabel(model.input),
+			inputModalities: getInputModalitiesLabel(model.input as string[] | null | undefined),
 			provider: model.provider,
 			modelId: model.id,
+			isFree: isFreeModelLocal(model as any),
 		});
 	}
 
-	// Sort by output price ascending
-	rows.sort((a, b) => a.outputPrice - b.outputPrice);
+	// Sort by output price ascending (nulls last)
+	rows.sort((a, b) => {
+		const av = a.outputPrice ?? Number.POSITIVE_INFINITY;
+		const bv = b.outputPrice ?? Number.POSITIVE_INFINITY;
+		return av - bv;
+	});
 	return rows;
 }
